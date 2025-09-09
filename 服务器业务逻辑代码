@@ -1,0 +1,1613 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <time.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+#include <string>
+
+#include <stdexcept>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
+
+#include "ngx_conf.h"
+#include "ngx_comm.h"
+#include "ngx_macro.h"
+#include "ngx_global.h"
+#include "ngx_func.h"
+#include "ngx_memory.h"
+#include "ngx_crc32.h"
+#include "ngx_logic.h"
+#include "ngx_database.h"
+#include "ngx_logiccomm.h"
+#include "ngx_lockmutex.h"
+
+unsigned long m_REGISTER_COUNT = 0;
+unsigned long m_LOGIN_COUNT = 0;
+unsigned long m_PING_COUNT = 0;
+unsigned long QPS = 0;
+//定义成员函数指针
+typedef bool (C_logic_Socket::*handler)(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength);
+//保存成员函数指针的数组
+static const handler statusHandler[]=
+{
+    //前五个预留，用于增加一些基本服务器功能
+    &C_logic_Socket::_HandlePing,           //【0】：心跳包的实现
+    NULL,                                   //【1】
+    NULL,                                   //【2】
+    NULL,                                   //【3】
+    NULL,                                   //【4】
+    &C_logic_Socket::_HandleRegister,       //【5】：实现具体的注册功能
+    &C_logic_Socket::_HandleLogIn,          //【6】：实现具体的登录功能
+    &C_logic_Socket::_HandleDBQuery,        //【7】: 实现数据库查询
+    &C_logic_Socket::_HandleDBINSERT_ITEM,  //【8】: 实现数据库插入物品
+    &C_logic_Socket::_HandleDBINSERT_TASK,  //【9】: 实现数据库插入任务
+    &C_logic_Socket::_HandleDBMODIFY_PLAYER,//【10】: 实现数据库修改人物
+    &C_logic_Socket::_HandleDBMODIFY_ITEM,  //【11】: 实现数据库修改物品
+    &C_logic_Socket::_HandleDBMODIFY_TASK,  //【12】: 实现数据库修改任务
+    &C_logic_Socket::_HandleSYNC_PLAYER,    //【13】: 实现玩家同步自己信息
+    &C_logic_Socket::_HandleSWAP_SCENE,     //【14】：切换场景
+    &C_logic_Socket::_HandleExit,           //【15】：退出游戏
+};
+#define AUTH_TOTAL_COMMANDS sizeof(statusHandler)/sizeof(handler)//整个命令有多少个，编译时即可知道
+
+//构造函数
+C_logic_Socket::C_logic_Socket()
+{
+    islog = true;
+    m_iLenRegister    = sizeof(STRUCT_REGISTER);
+    m_iLenLogin       = sizeof(STRUCT_LOGIN);
+    m_iLenQuery       = sizeof(STRUCT_DBQUERY);
+    m_iLenDbinsert1   = sizeof(STRUCT_DBINSERT1);
+    m_iLenDbinsert2   = sizeof(STRUCT_DBINSERT2);
+    m_iLenDbmodify1   = sizeof(STRUCT_DBMODIFY1);
+    m_iLenDbmodify2   = sizeof(STRUCT_DBMODIFY2);
+    m_iLenDbmodify3   = sizeof(STRUCT_DBMODIFY3);
+    m_iLenSyncPlayer  = sizeof(STRUCT_SYNC_PLAYER);
+    m_iLenChangeScene = sizeof(STRUCT_CHANGESCENE);
+    m_iLenExit        = sizeof(STRUCT_EXIT);
+}
+//析构函数
+C_logic_Socket::~C_logic_Socket()
+{
+    StopSceneSyncThreads();
+    for(int i = 1; i <= 3; ++i) 
+    {
+        pthread_mutex_destroy(&m_sceneMsgMutex[i]);
+        sem_destroy(&m_sceneMsgSem[i]);
+        //释放队列中残留的消息
+        pthread_mutex_lock(&m_sceneMsgMutex[i]);
+        while(!m_sceneMsgQueues[i].empty())
+        {
+            SceneMsg &msg = m_sceneMsgQueues[i].front();
+            C_Memory::GetInstance()->FreeMemory(msg.msgBuf);
+            m_sceneMsgQueues[i].pop();
+        }
+        pthread_mutex_unlock(&m_sceneMsgMutex[i]);
+    }
+}
+//初始化函数，在fork子进程前执行
+bool C_logic_Socket::Initialize()
+{
+    for(int i = 1; i <= 3; ++i)
+    {
+        if(pthread_mutex_init(&m_sceneMutex[i],NULL) != 0)
+        {
+            ngx_log_stderror(errno,"C_logic_Socket::Initialize() 初始化场景%d互斥锁失败", i);
+            return false;
+        }
+        m_sceneThreadRunning[i] = true;
+
+        if(pthread_mutex_init(&m_sceneMsgMutex[i], NULL) != 0)
+        {
+            ngx_log_stderror(errno,"初始化场景%d消息队列互斥锁失败",i);
+            return false;
+        }
+        if(sem_init(&m_sceneMsgSem[i],0,0) != 0)
+        {
+            ngx_log_stderror(errno,"初始化场景%d消息队列信号量失败",i);
+            pthread_mutex_destroy(&m_sceneMsgMutex[i]);
+            return false;
+        }
+    }
+
+    if(!StartSceneSyncThreads())
+    {
+        return false;
+    }
+    return true;
+}
+//处理收到的数据，p_MsgBuf格式为：消息头+包头+包体
+void C_logic_Socket::threadRecvProcFunc(char *p_MsgBuf)
+{
+    p_STRUC_MSG_HEADER p_MsgHeader = (p_STRUC_MSG_HEADER)p_MsgBuf;                    //消息头
+    p_COMM_PKG_HEADER  p_PkgHeader = (p_COMM_PKG_HEADER)(p_MsgBuf + m_iLenMsgHeader); //包头
+    void *p_PkgBody = NULL;                                                           //指向包体的指针
+    unsigned short pkglen = ntohs(p_PkgHeader->pkgLen);                               //客户端指明的包宽度
+    
+    if(m_iLenPkgHeader == pkglen)//只有包头，没有包体的情况
+    {
+        if(p_PkgHeader->crc32 != 0)//此时crc值应为0
+        {
+            return;
+        }
+        p_PkgBody = NULL;
+    }
+    else//有包体
+    {
+        p_PkgHeader->crc32 = ntohl(p_PkgHeader->crc32);                 //把4字节的数据网络序转主机序
+        p_PkgBody = (void *)(p_MsgBuf+m_iLenMsgHeader+m_iLenPkgHeader); //让指针指向包体
+
+        //计算crc值判断包的完整性
+        int calc_crc = C_CRC32::GetInstance()->Get_CRC((unsigned char *)p_PkgBody,pkglen-m_iLenPkgHeader);
+        if(calc_crc != p_PkgHeader->crc32)
+        {
+            ngx_log_stderror(0,"C_logic_Socket::threadRecvProcFunc()中CRC错误,丢弃数据!");
+            return;
+        }
+    }
+    //走到这里，crc校验通过
+    unsigned short imsgCode = ntohs(p_PkgHeader->msgCode);//消息代码拿出来
+    p_ngx_connect_type p_Conn = p_MsgHeader->pConn;//拿出消息头中的连接池中连接的指针
+    
+    //进行一些情况判断
+    //(1)如果从收到客户端发送来的包，到服务器给一个线程池中的线程处理该包的过程中，客户端断开了这种收到的包就不必处理了
+    if(p_Conn->iCurrsequence != p_MsgHeader->iCurrsequence)//该连接已经被其他tcp占用
+    {
+        return;
+    }
+    //(2)判断消息码是否正确，防止出现不在服务器处理范围内的消息码
+    if(imsgCode >= AUTH_TOTAL_COMMANDS)
+    {
+        ngx_log_stderror(0,"C_logic_Socket::threadRecvProcFunc()中imsgCode=%d消息码不对!",imsgCode); 
+        return;
+    }
+    //(3)走到这里，说明包没过期，无恶意，判断是否有处理函数
+    if(statusHandler[imsgCode] == NULL)
+    {
+        ngx_log_stderror(0,"CLogicSocket::threadRecvProcFunc()中imsgCode=%d消息码找不到对应的处理函数!",imsgCode);
+        return;
+    }
+    //非常正确，一切正常，调用消息码对应的处理函数
+    if(islog)ngx_log_stderror(0,"收到消息码:%d",imsgCode);
+    (this->*statusHandler[imsgCode])(p_Conn,p_MsgHeader,(char *)p_PkgBody,pkglen-m_iLenPkgHeader);
+    return;
+}
+//心跳包检测时间到，该去检测心跳包是否超时
+void C_logic_Socket::procPingTimeOutChecking(p_STRUC_MSG_HEADER tmpmsg,time_t cur_time)
+{
+    C_Memory *p_memory = C_Memory::GetInstance();
+    if(tmpmsg->iCurrsequence == tmpmsg->pConn->iCurrsequence)//此链接没断
+    {
+        p_ngx_connect_type p_Conn = tmpmsg->pConn;
+        if(m_ifTimeOutKick == 1)
+        {
+            zdCloseSocketProc(p_Conn);
+            return;
+        }
+        //超时踢的判断标准就是 每次检查的时间间隔*3，超过这个时间没发送心跳包，就踢【可以根据实际情况自由设定】
+        if((cur_time-p_Conn->lastPingTime)>(m_waitTime*3+10))
+        {
+            //踢出去【如果此时此刻该用户正好断线，则这个socket可能立即被后续上来的连接复用  如果真有人这么倒霉，赶上这个点了，那么可能错踢，错踢就错踢】
+            zdCloseSocketProc(p_Conn);
+        }
+        p_memory->FreeMemory(tmpmsg);
+    }
+    else//此连接断了
+    {
+        p_memory->FreeMemory(tmpmsg);//释放内存
+    }
+    return;
+}
+//发送没有包体的数据给客户端
+void C_logic_Socket::SendNoBodyPkgToClient(p_STRUC_MSG_HEADER p_MsgHeader,unsigned short iMsgCode)
+{
+    C_Memory *p_memory = C_Memory::GetInstance();
+
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader+m_iLenPkgHeader,false);
+    char *p_tmpbuf = p_sendbuf;
+
+    memcpy(p_tmpbuf,p_MsgHeader,m_iLenMsgHeader);
+    p_tmpbuf += m_iLenMsgHeader;
+
+    p_COMM_PKG_HEADER p_PkgHeader = (p_COMM_PKG_HEADER)p_tmpbuf;//指向我要发送出去的包的包头
+    p_PkgHeader->msgCode = htons(iMsgCode);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader);
+    p_PkgHeader->crc32 = 0;
+    msgSend(p_sendbuf);
+    return;
+}
+//找到玩家所在场景
+int C_logic_Socket::FindUserScene(int userID)
+{
+    for(int i = 1;i <= 3;++i)
+    {
+        for(auto x:m_ScenePlayers[i])
+        {
+            if(userID == x.userID)return i;
+        }
+    }
+    return -1;
+}
+//启动场景同步线程
+bool C_logic_Socket::StartSceneSyncThreads()
+{
+    for(int i = 1; i <= 3; ++i)
+    {
+        ThreadArgs* pArgs = new ThreadArgs();
+        pArgs->pThis = this;  // 传入当前对象指针
+        pArgs->sceneId = i;   // 传入场景ID
+        if(pthread_create(&m_sceneThreads[i], NULL, SceneSyncThread, (void*)pArgs) != 0)
+        {
+            ngx_log_stderror(errno,"C_logic_Socket::StartSceneSyncThreads() 创建场景%d线程失败", i);
+            delete pArgs;
+            return false;
+        }
+        if(islog)ngx_log_stderror(0, "场景%d同步线程启动成功,进程ID:%d", i, getpid());
+
+    }
+    return true;
+}
+//停止场景同步线程
+void C_logic_Socket::StopSceneSyncThreads()
+{
+    for(int i = 1; i <= 3; ++i)
+    {
+        m_sceneThreadRunning[i] = false;
+        if(m_sceneThreads[i] != 0)
+        {
+            pthread_join(m_sceneThreads[i], NULL);
+            m_sceneThreads[i] = 0;
+        }
+        pthread_mutex_destroy(&m_sceneMutex[i]);
+    }
+}
+//场景同步线程主函数
+void* C_logic_Socket::SceneSyncThread(void* arg)
+{
+    ThreadArgs* pArgs = (ThreadArgs*)arg;
+    C_logic_Socket* pThis = pArgs->pThis;  // 获取对象指针
+    int sceneId = pArgs->sceneId;          // 获取场景ID
+    delete pArgs;  // 释放参数内存
+
+    if(pThis->islog)ngx_log_stderror(0, "场景%d同步线程开始运行,进程ID:%d", sceneId, getpid());
+    //通过对象指针访问类成员（需确保线程安全）
+    while(pThis->m_sceneThreadRunning[sceneId])
+    {   
+        usleep(50000);
+        //sem_wait(&pThis->m_sceneMsgSem[sceneId]);
+        if(!pThis->m_sceneThreadRunning[sceneId])break;
+
+        pThis->DoSceneSync(sceneId);
+    }
+    if(pThis->islog)ngx_log_stderror(0, "场景%d同步线程退出,进程ID:%d", sceneId, getpid());
+    return NULL;
+}
+//向所有玩家发送同步包
+void C_logic_Socket::DoSceneSync(int sceneId)
+{
+    C_Memory *p_memory = C_Memory::GetInstance();
+    std::queue<SceneMsg> tempQueue;
+
+    //取出当前场景的所有消息
+    pthread_mutex_lock(&m_sceneMsgMutex[sceneId]);
+    std::swap(tempQueue, m_sceneMsgQueues[sceneId]);
+    pthread_mutex_unlock(&m_sceneMsgMutex[sceneId]);
+
+    while(!tempQueue.empty())
+    {
+        SceneMsg &msg = tempQueue.front();
+        char *sharedMsgBody = msg.msgBuf;  //共享的消息体
+        int sharedBodyLen = msg.msgLen;    //共享消息体长度
+
+        std::vector<p_ngx_connect_type> targetConns;  //目标连接列表
+        std::vector<int> targetSequences;             //对应连接的序列号
+
+        pthread_mutex_lock(&m_sceneMutex[sceneId]);
+        for(auto &player : m_ScenePlayers[sceneId])
+        {
+            //if(player.userID != msg.senderUserID)
+            {
+                targetConns.push_back(player.pConn);
+                targetSequences.push_back(player.pConn->iCurrsequence);
+            }
+        }
+        pthread_mutex_unlock(&m_sceneMutex[sceneId]);  //尽早释放锁
+
+        //为每个玩家生成消息头并发送（仅分配消息头内存）
+        for(size_t i = 0; i < targetConns.size();++i)
+        {
+            //仅分配消息头内存（消息体复用sharedMsgBody）
+            int totalLen = m_iLenMsgHeader + sharedBodyLen;
+            char *sendBuf = (char*)p_memory->AllocMemory(totalLen, false);
+            //填充消息头
+            p_STRUC_MSG_HEADER pMsgHeader = (p_STRUC_MSG_HEADER)sendBuf;
+            pMsgHeader->pConn = targetConns[i];
+            pMsgHeader->iCurrsequence = targetSequences[i];
+            //复制共享消息体（仅一次内存分配，多次复用内容）
+            memcpy(sendBuf + m_iLenMsgHeader, sharedMsgBody, sharedBodyLen);
+            //发送消息
+            msgSend(sendBuf);
+            if(islog)ngx_log_stderror(0,"同步消息发送成功,发送(100包体+16消息头+8包头)字节");
+        }
+        //释放共享消息体
+        p_memory->FreeMemory(sharedMsgBody);
+        tempQueue.pop();
+    }
+}
+//从场景中移除指定连接的玩家
+bool C_logic_Socket::RemovePlayerByConn(p_ngx_connect_type p_Conn)
+{
+    if(p_Conn == nullptr)return false;
+
+    //用于保存找到的玩家信息（在锁外使用）
+    int foundUserId = -1;
+    int foundSceneId = -1;
+    bool found = false;
+
+    //遍历所有场景查找该连接对应的玩家
+    for(int sceneId = 1; sceneId <= 3 && !found; ++sceneId)//场景ID为1-3
+    {
+        pthread_mutex_lock(&m_sceneMutex[sceneId]);//加锁保护场景数据
+
+        auto& playerList = m_ScenePlayers[sceneId];
+        for(auto it = playerList.begin(); it != playerList.end(); ++it)
+        {
+            //找到匹配的连接
+            if(it->pConn == p_Conn)
+            {
+                foundUserId = it->userID;
+                foundSceneId = sceneId;
+                //从内存队列中移除玩家（这是需要锁保护的核心操作）
+                playerList.erase(it);
+                if(islog)ngx_log_stderror(0,"玩家[%d]已从场景[%d]内存队列中移除",foundUserId,foundSceneId); 
+                found = true;
+                break; //跳出内部循环
+            }
+        }
+        pthread_mutex_unlock(&m_sceneMutex[sceneId]);
+    }
+
+    //如果没找到玩家，直接返回
+    if(!found)
+    {
+        ngx_log_stderror(0, "玩家已下线,连接等待回收");
+        return false;
+    }
+    //构建场景表名
+    C_Database* p_db = C_Database::GetInstance();
+    char sceneTableName[32];snprintf(sceneTableName, sizeof(sceneTableName), "scene%d_sync", foundSceneId);
+    //从场景表查询玩家当前的x、y、z
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    char selectSql[256];snprintf(selectSql, sizeof(selectSql), "SELECT x, y, z FROM %s WHERE userID = ?", sceneTableName);
+    //准备参数
+    std::vector<MYSQL_BIND> selectParams;
+    MYSQL_BIND selectParam;
+    memset(&selectParam,0,sizeof(selectParam));
+    selectParam.buffer_type = MYSQL_TYPE_LONG;
+    selectParam.buffer = &foundUserId;
+    selectParams.emplace_back(selectParam);
+
+    bool querySuccess = p_db->CommonQuery(selectSql, selectParams, [&](MYSQL_STMT* stmt) {
+        MYSQL_BIND resultBind[3];memset(resultBind, 0, sizeof(resultBind));
+        
+        resultBind[0].buffer_type = MYSQL_TYPE_FLOAT;
+        resultBind[0].buffer = &x;
+        resultBind[1].buffer_type = MYSQL_TYPE_FLOAT;
+        resultBind[1].buffer = &y;
+        resultBind[2].buffer_type = MYSQL_TYPE_FLOAT;
+        resultBind[2].buffer = &z;
+
+        if(mysql_stmt_bind_result(stmt, resultBind) != 0) 
+        {
+            ngx_log_stderror(0, "查询玩家坐标失败: %s", mysql_stmt_error(stmt));
+            throw std::runtime_error("查询玩家坐标失败");
+        }
+        if(mysql_stmt_fetch(stmt) != 0) 
+        {
+            ngx_log_stderror(0, "获取玩家坐标结果失败: %s", mysql_stmt_error(stmt));
+            throw std::runtime_error("获取玩家坐标结果失败");
+        }
+    });
+
+    //确定要更新的场景ID
+    int newSceneId;
+    if(foundSceneId != 1)
+    {
+        x = y = z = 100.0;
+        newSceneId = 1;    
+    }
+    else newSceneId = foundSceneId;
+    //更新player_account表中的x、y、z和sceneId
+    if(querySuccess)
+    {
+        char updateSql[256];
+        snprintf(updateSql, sizeof(updateSql),"UPDATE player_account SET x = ?, y = ?, z = ?, sceneId = ? WHERE account_id = ?");
+
+        std::vector<MYSQL_BIND> updateParams;
+        MYSQL_BIND param[5];memset(param, 0, sizeof(param));
+
+        param[0].buffer_type = MYSQL_TYPE_FLOAT;
+        param[0].buffer = &x;
+        param[1].buffer_type = MYSQL_TYPE_FLOAT;
+        param[1].buffer = &y;
+        param[2].buffer_type = MYSQL_TYPE_FLOAT;
+        param[2].buffer = &z;
+        param[3].buffer_type = MYSQL_TYPE_LONG;
+        param[3].buffer = &newSceneId;
+        param[4].buffer_type = MYSQL_TYPE_LONG;
+        param[4].buffer = &foundUserId;
+
+        for(int i = 0; i < 5; ++i)updateParams.emplace_back(param[i]);
+        
+        int updateResult = p_db->CommonUpdate(updateSql, updateParams, false);
+        if(updateResult != -1)
+        {
+            if(islog)ngx_log_stderror(0, "玩家[%d]坐标和场景更新到player_account成功", foundUserId);
+        } 
+        else 
+        {
+            ngx_log_stderror(0, "玩家[%d]坐标和场景更新到player_account失败", foundUserId);
+        }
+    }
+    //从数据库场景表中删除
+    char deleteSql[256];snprintf(deleteSql, sizeof(deleteSql),"DELETE FROM %s WHERE userID = ?", sceneTableName);
+    //准备参数
+    std::vector<MYSQL_BIND> deleteParams;
+    MYSQL_BIND deleteParam;memset(&deleteParam,0,sizeof(deleteParam));
+    deleteParam.buffer_type = MYSQL_TYPE_LONG;
+    deleteParam.buffer = &foundUserId;
+    deleteParams.emplace_back(deleteParam);
+    //执行删除
+    int deleteResult = p_db->CommonDelete(deleteSql, deleteParams, false);
+    if(deleteResult == -1)
+    {
+        ngx_log_stderror(0,"删除玩家失败");
+    }
+    return true;
+}
+//以下处理各种业务逻辑函数--------------------------------------------------------------------------------------------------------------------------
+//注册
+bool C_logic_Socket::_HandleRegister(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //(1)判断包体合法性
+    if(p_PkgBody == NULL || iBodyLength != m_iLenRegister)//具体看客户端服务器约定，如果约定这个命令[msgCode]必须带包体，那么如果不带包体，就认为是恶意包，直接不处理
+    {
+        return false;
+    }
+    //(2)针对某个用户的命令，一般都要互斥，需要把临界的变量添加到ngx_connection_s中
+    C_lock lock(&p_Conn->logicProcMutex);
+    //(3)取到了整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_REGISTER p_RecvInfo = (p_STRUCT_REGISTER)p_PkgBody;
+    //所有数值型,short,int,long,uint64_t,int64_t这种都不要忘记传输之前主机网络序，收到后网络转主机序
+    p_RecvInfo->username[sizeof(p_RecvInfo->username)-1] = 0;   //这非常关键，防止客户端发送过来畸形包，导致服务器直接使用这个数据出现错误。
+    p_RecvInfo->password[sizeof(p_RecvInfo->password)-1] = 0;   //这非常关键，防止客户端发送过来畸形包，导致服务器直接使用这个数据出现错误。
+    p_RecvInfo->name[sizeof(p_RecvInfo->name)-1] = 0;           //这非常关键，防止客户端发送过来畸形包，导致服务器直接使用这个数据出现错误。
+    p_RecvInfo->gender = ntohl(p_RecvInfo->gender);
+    if(islog)ngx_log_stderror(0,"------------开始处理注册-------------");
+    if(islog)ngx_log_stderror(0,"原始数据->username:%s|password:%s|gender:%d|name:%s",p_RecvInfo->username,p_RecvInfo->password,p_RecvInfo->gender,p_RecvInfo->name);
+    //(4)这里考虑业务逻辑是否合理，进一步判断数据合法，将来自由发挥--------------
+    STRUCT_REG_LOG_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    rsp.flag = -1;
+    
+    const char *sql;
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[4];memset(param, 0, sizeof(param));
+    //(4.1)先进行查询是否存在用户名
+    sql = Query4;
+    param[0].buffer_type = MYSQL_TYPE_STRING;
+    param[0].buffer = p_RecvInfo->username;
+    
+    params.emplace_back(param[0]);
+    bool usernameExists = false;
+    bool rst=p_db->CommonQuery(sql,params,[&](MYSQL_STMT *stmt){
+        MYSQL_BIND resultBind;
+        memset(&resultBind, 0, sizeof(resultBind));
+        int exists;  // 存储查询结果（1表示存在）
+        resultBind.buffer_type = MYSQL_TYPE_LONG;
+        resultBind.buffer = &exists;
+        resultBind.is_null = nullptr;
+        
+        if(mysql_stmt_bind_result(stmt, &resultBind) != 0)throw std::runtime_error(std::string("绑定查询结果失败: ") + mysql_stmt_error(stmt));
+
+        int fetchResult = mysql_stmt_fetch(stmt);
+        if (fetchResult == 0){
+            usernameExists = true;
+            ngx_log_stderror(0,"用户名%s已存在",p_RecvInfo->username);
+        }
+    });
+    params.clear();
+    //(4.2)如果不存在执行插入
+    if(rst && !usernameExists)
+    {
+        sql = Insert3;
+        param[0].buffer_type = MYSQL_TYPE_STRING;
+        param[0].buffer = p_RecvInfo->username;
+        param[0].buffer_length = strlen(p_RecvInfo->username) + 1;//关键：设置字符串长度
+        param[0].is_null = nullptr;
+
+        param[1].buffer_type = MYSQL_TYPE_STRING;
+        param[1].buffer = p_RecvInfo->password;
+        param[1].buffer_length = strlen(p_RecvInfo->password) + 1;//关键：设置长度
+        param[1].is_null = nullptr;
+
+        param[2].buffer_type = MYSQL_TYPE_LONG;
+        param[2].buffer = &p_RecvInfo->gender;
+        param[2].is_null = nullptr;
+        
+        //兼容中文字符
+        std::string name_str(p_RecvInfo->name);
+        name_str += '\0';
+        param[3].buffer_type = MYSQL_TYPE_STRING;
+        param[3].buffer = (char *)name_str.c_str();
+        param[3].buffer_length = name_str.size();//关键：设置长度
+        param[3].is_null = nullptr;
+        for(int i=0;i<=3;i++)params.emplace_back(param[i]);
+    
+        int result = p_db->CommonInsert(sql,params,0);
+        if(result == -1)
+        {
+            rsp.flag = result;
+            ngx_log_stderror(0,"注册失败");
+        }
+        else 
+        {
+            rsp.userID = result;
+            rsp.flag = 1;
+            if(islog)ngx_log_stderror(0,"注册成功,userid=%d",result);
+        }
+    }
+    //-----------------------------------------
+    //(5)给客户端返回数据时，一般也是返回一个结构，这个结构内容具体由客户端/服务器协商，这里就以给客户端也返回同样的 STRUCT_REGISTER 结构来举例
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32  *p_crc32 = C_CRC32::GetInstance();
+    int iSendLen = p_db->serialize_register_rsp(rsp,NULL);
+    //(5.1)分配要发出去的包的内存
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader+m_iLenPkgHeader+iSendLen,false);
+    //(5.2)填充消息头
+    memcpy(p_sendbuf,p_MsgHeader,m_iLenMsgHeader);
+    //(5.3)填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf+m_iLenMsgHeader);   //指向包头                        
+    p_PkgHeader->msgCode = htons(_CMD_SEND_REGISTER);               //消息代码，统一在ngx_logiccomm.h中定义,用htons主机序转网络序
+    p_PkgHeader->pkgLen  = htons(m_iLenPkgHeader + iSendLen);       //整个包的尺寸
+    //(5.4)填充包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    //(5.5)计算实际序列化后包体大小
+    int actual_len = 0;
+    actual_len=p_db->serialize_register_rsp(rsp,p_sendInfo);
+    if (actual_len != iSendLen) 
+    {
+        if(islog)ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", iSendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    //(5.6)包体内容全部确定，计算crc32值
+    p_PkgHeader->crc32 = p_crc32->Get_CRC((unsigned char *)p_sendInfo,iSendLen);
+    p_PkgHeader->crc32 = htonl(p_PkgHeader->crc32);
+    //(5.7)发送数据包
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBINSERT_account响应发送成功,发送(%d包体+16消息头+8包头)字节", iSendLen);
+    m_REGISTER_COUNT++;
+    return true;
+}
+//登录
+bool C_logic_Socket::_HandleLogIn(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //判断包体是否合法
+    if(p_PkgBody == NULL || iBodyLength != m_iLenLogin)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取得整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_LOGIN p_RecvInfo = (p_STRUCT_LOGIN)p_PkgBody;
+    p_RecvInfo->username[sizeof(p_RecvInfo->username)-1] = 0;
+    p_RecvInfo->password[sizeof(p_RecvInfo->password)-1] = 0;
+    if(islog)ngx_log_stderror(0, "-----------开始处理登录-----------");
+    if(islog)ngx_log_stderror(0, "原始数据->username:%s,password:%s", p_RecvInfo->username, p_RecvInfo->password);
+    
+    //初始化响应结构体
+    STRUCT_REG_LOG_RSP rsp;memset(&rsp, 0, sizeof(rsp));
+    //选择sql语句
+    const char *sql = Query5;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param;memset(&param, 0, sizeof(param));
+    param.buffer_type = MYSQL_TYPE_STRING;
+    param.buffer = p_RecvInfo->username;
+    param.buffer_length = strlen(p_RecvInfo->username) + 1;//关键：设置字符串长度
+    param.is_null = nullptr;
+    params.emplace_back(param);
+    //验证登录账号密码
+    rsp.flag = -1;  //默认查询失败
+    bool querySuccess = p_db->CommonQuery(const_cast<char*>(sql), params,
+        [&](MYSQL_STMT *stmt) 
+        {
+            //绑定查询结果：用户名和密码字段
+            MYSQL_BIND resultBind[3];
+            memset(resultBind, 0, sizeof(resultBind));
+            
+            int dbAccountId = -1;
+            char dbUsername[64] = {0};
+            char dbPassword[64] = {0};
+            resultBind[0].buffer_type = MYSQL_TYPE_LONG;resultBind[0].buffer = &dbAccountId;resultBind[0].length = nullptr;
+            resultBind[1].buffer_type = MYSQL_TYPE_STRING;resultBind[1].buffer = dbUsername;resultBind[1].buffer_length = sizeof(dbUsername) - 1;
+            resultBind[2].buffer_type = MYSQL_TYPE_STRING;resultBind[2].buffer = dbPassword;resultBind[2].buffer_length = sizeof(dbPassword) - 1;
+
+            if(mysql_stmt_bind_result(stmt, resultBind) != 0){
+                if(islog)ngx_log_stderror(0, "绑定登录查询结果失败: %s", mysql_stmt_error(stmt));
+                return;
+            }
+            //获取查询结果
+            int fetchResult = mysql_stmt_fetch(stmt);
+            if(fetchResult != 0){
+                rsp.flag = -1;
+                if(islog)ngx_log_stderror(0, "用户名不存在：%s", p_RecvInfo->username);
+                return;
+            }
+            //验证密码
+            if(strcmp(p_RecvInfo->password, dbPassword) != 0){
+                rsp.flag = -1;
+                if(islog)ngx_log_stderror(0, "用户%s密码错误", p_RecvInfo->username);
+                return;
+            }
+            //登录成功,返回账号ID
+            rsp.userID = dbAccountId;
+            rsp.flag = 1;
+            if(islog)ngx_log_stderror(0, "用户%s登录成功,userID=%d", p_RecvInfo->username,dbAccountId);
+        }
+    );
+    if(FindUserScene(rsp.userID) != -1)
+    {
+        ngx_log_stderror(0,"用户已经登录");
+        return false;
+    }
+
+    //登录成功后处理场景同步表
+    if(rsp.flag == 1 && rsp.userID != -1)
+    {
+        //从player_account查询用户属性和场景ID
+        int playerHP = 0;
+        float playerX = 0.0f, playerY = 0.0f, playerZ = 0.0f;
+        int playerSceneId = 1; //默认场景1
+        const char* queryPlayerSql = Query8;
+        
+        std::vector<MYSQL_BIND> queryParams;
+        MYSQL_BIND queryParam;
+        memset(&queryParam, 0, sizeof(queryParam));
+        queryParam.buffer_type = MYSQL_TYPE_LONG;
+        queryParam.buffer = &rsp.userID;
+        queryParams.emplace_back(queryParam);
+
+        bool queryPlayerSuccess = p_db->CommonQuery(const_cast<char*>(queryPlayerSql), queryParams,
+            [&](MYSQL_STMT* stmt)
+            {
+                MYSQL_BIND resultBind[6];
+                memset(resultBind, 0, sizeof(resultBind));
+                
+                int dbAccountId;
+                resultBind[0].buffer_type = MYSQL_TYPE_LONG;resultBind[0].buffer = &dbAccountId;
+                resultBind[1].buffer_type = MYSQL_TYPE_LONG;resultBind[1].buffer = &playerHP;
+                resultBind[2].buffer_type = MYSQL_TYPE_FLOAT;resultBind[2].buffer = &playerX;
+                resultBind[3].buffer_type = MYSQL_TYPE_FLOAT;resultBind[3].buffer = &playerY;
+                resultBind[4].buffer_type = MYSQL_TYPE_FLOAT;resultBind[4].buffer = &playerZ;
+                resultBind[5].buffer_type = MYSQL_TYPE_LONG;resultBind[5].buffer = &playerSceneId;
+                if(mysql_stmt_bind_result(stmt, resultBind) != 0)
+                {
+                    if(islog)ngx_log_stderror(0, "绑定玩家属性查询结果失败: %s", mysql_stmt_error(stmt));
+                    throw std::runtime_error("绑定玩家属性查询结果失败");
+                }
+                if(mysql_stmt_fetch(stmt) != 0) {
+                    if(islog) ngx_log_stderror(0, "获取玩家属性结果失败: %s", mysql_stmt_error(stmt));
+                    throw std::runtime_error("获取玩家属性结果失败");
+                }
+            }
+        );
+
+        //构建场景表名
+        char sceneTableName[32];
+        snprintf(sceneTableName, sizeof(sceneTableName), "scene%d_sync", playerSceneId);
+        //添加到对应场景表
+        char insertSql[256];
+        snprintf(insertSql, sizeof(insertSql),"INSERT INTO %s (userID, hp, x, y, z, rotaX, rotaY, rotaZ, beh, weap_id) VALUES (?,?,?,?,?,0,0,0,0,0)",sceneTableName);
+        //准备查询参数
+        std::vector<MYSQL_BIND> insertParams;
+        MYSQL_BIND insertParam[5];memset(&insertParam, 0, sizeof(insertParam));
+        insertParam[0].buffer_type = MYSQL_TYPE_LONG;insertParam[0].buffer = &rsp.userID;
+        insertParam[1].buffer_type = MYSQL_TYPE_LONG;insertParam[1].buffer = &playerHP;
+        insertParam[2].buffer_type = MYSQL_TYPE_FLOAT;insertParam[2].buffer = &playerX;
+        insertParam[3].buffer_type = MYSQL_TYPE_FLOAT;insertParam[3].buffer = &playerY;
+        insertParam[4].buffer_type = MYSQL_TYPE_FLOAT;insertParam[4].buffer = &playerZ;
+        for(int i = 0;i <= 4;++i)insertParams.emplace_back(insertParam[i]);
+        //执行插入
+        int insertResult = p_db->CommonInsert(insertSql, insertParams, false);
+        if(insertResult != -1)if(islog)ngx_log_stderror(0, "用户%d已添加到%s表", rsp.userID, sceneTableName);
+        else ngx_log_stderror(0, "用户%d添加到%s表失败", rsp.userID, sceneTableName);
+        //加入在线队列里
+        ConnUserMap tmp;
+        tmp.pConn = p_Conn;
+        tmp.userID = rsp.userID;
+        tmp.iCurrsequence = p_Conn->iCurrsequence;
+        pthread_mutex_lock(&m_sceneMutex[playerSceneId]); 
+        m_ScenePlayers[playerSceneId].push_back(tmp);
+        pthread_mutex_unlock(&m_sceneMutex[playerSceneId]);
+
+        if(islog)ngx_log_stderror(0,"场景1:%d人|场景2:%d人|场景3:%d人",m_ScenePlayers[1].size(),m_ScenePlayers[2].size(),m_ScenePlayers[3].size());
+    }
+
+    //返回一个结构
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_register_rsp(rsp,NULL);
+    //分配内存
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen,false);
+    memcpy(p_sendbuf,p_MsgHeader,m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_LOGIN);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    //填充包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len=p_db->serialize_register_rsp(rsp,p_sendInfo);
+    if (actual_len != SendLen) 
+    {
+        if(islog)ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    //计算CRC值
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据包
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBLOGIN响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    //m_LOGIN_COUNT++;
+    return true;
+}
+//Ping
+bool C_logic_Socket::_HandlePing(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //心跳包要求没有包体，有则是非法包
+    if(iBodyLength != 0)
+    {
+        return false;
+    }
+
+    C_lock lock(&p_Conn->logicProcMutex);  //凡是和本用户有关的访问都考虑用互斥，避免同时发送两个命令过来达到作弊目的
+    p_Conn->lastPingTime = time(NULL);     //更新时间
+    //服务器也返回一个只有包头的数据包给客户端
+    SendNoBodyPkgToClient(p_MsgHeader,_CMD_SEND_PING);
+    //m_PING_COUNT++;
+    return true;
+}
+//查询
+bool C_logic_Socket::_HandleDBQuery(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //验证包体合法性
+    if(p_PkgBody == NULL || iBodyLength != m_iLenQuery)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取到整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_DBQUERY p_RecvInfo = (p_STRUCT_DBQUERY)p_PkgBody;
+    p_RecvInfo->queryType = ntohl(p_RecvInfo->queryType);
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    if(p_RecvInfo->queryType==1)if(islog)ngx_log_stderror(0, "---------开始处理查询(人物)-----");
+    if(p_RecvInfo->queryType==2)if(islog)ngx_log_stderror(0, "---------开始处理查询(背包)-----");
+    if(p_RecvInfo->queryType==3)if(islog)ngx_log_stderror(0, "---------开始处理查询(任务)-----");
+    if(islog)ngx_log_stderror(0,"原始数据->type=%d, userId=%d", p_RecvInfo->queryType, p_RecvInfo->userID);
+
+    //初始化响应结构体
+    STRUCT_DBQUERY_RSP1 rsp1; memset(&rsp1, 0, sizeof(STRUCT_DBQUERY_RSP1));
+    STRUCT_DBQUERY_RSP2 rsp2; memset(&rsp2, 0, sizeof(STRUCT_DBQUERY_RSP2));
+    STRUCT_DBQUERY_RSP3 rsp3; memset(&rsp3, 0, sizeof(STRUCT_DBQUERY_RSP3));
+    //根据查询类型选择SQL
+    const char* sql = nullptr;
+    switch(p_RecvInfo->queryType)
+    {
+        case 1: sql = QUERY1; break;
+        case 2: sql = QUERY2; break;
+        case 3: sql = QUERY3; break;
+        default: return false;
+    }
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param;memset(&param, 0, sizeof(param));
+    param.buffer_type = MYSQL_TYPE_LONG;
+    param.buffer = &p_RecvInfo->userID;
+    params.push_back(param);
+    //执行通用查询
+    bool queryResult = p_db->CommonQuery(const_cast<char*>(sql),params,
+        [&](MYSQL_STMT* stmt) 
+        {
+            //处理结果集元数据
+            MYSQL_RES* result = mysql_stmt_result_metadata(stmt);
+            if(result == nullptr)
+            {
+                ngx_log_stderror(0, "无查询结果 metadata");
+                throw std::exception();
+            }
+            MYSQL_FIELD* fields = mysql_fetch_fields(result);
+            unsigned int num_fields = mysql_num_fields(result);
+            if(num_fields == 0)
+            {
+                mysql_free_result(result);
+                throw std::exception();
+            }
+            //绑定结果缓冲区
+            MYSQL_BIND* result_bind = new MYSQL_BIND[num_fields];
+            char** field_buffers = new char*[num_fields];
+            for(unsigned int i = 0; i < num_fields; ++i)
+            {
+                field_buffers[i] = new char[256];
+                memset(&result_bind[i], 0, sizeof(MYSQL_BIND));
+                result_bind[i].buffer_type = MYSQL_TYPE_STRING;
+                result_bind[i].buffer = field_buffers[i];
+                result_bind[i].buffer_length = 255;
+            }
+            if(mysql_stmt_bind_result(stmt, result_bind) != 0)
+            {
+                ngx_log_stderror(0, "绑定结果失败: %s", mysql_stmt_error(stmt));
+                throw std::exception();
+            }
+            //读取结果并填充响应结构体
+            int index = 0;
+            while(index < 50 && mysql_stmt_fetch(stmt) == 0)
+            {
+                switch(p_RecvInfo->queryType)
+                {
+                    case 1://角色属性
+                        rsp1.gender     = atoi((char*)result_bind[0].buffer);
+                        strncpy(rsp1.name,(char*)result_bind[1].buffer,55);rsp1.name[55]='\0';
+                        rsp1.hp         = atoi((char*)result_bind[2].buffer);
+                        rsp1.atk        = atoi((char*)result_bind[3].buffer);
+                        rsp1.piercing   = atoi((char*)result_bind[4].buffer);
+                        rsp1.x          = atof((char*)result_bind[5].buffer);
+                        rsp1.y          = atof((char*)result_bind[6].buffer);
+                        rsp1.z          = atof((char*)result_bind[7].buffer);
+                        rsp1.scene_id   = atoi((char*)result_bind[8].buffer);
+                        if(islog)ngx_log_stderror(0,"查到数据->角色属性:gender:%d|name:%s|hp:%d|atk:%d|piercing:%d|x:%.2f|y:%.2f|z:%.2f|scene_id:%d",rsp1.gender,rsp1.name,rsp1.hp, rsp1.atk, rsp1.piercing, rsp1.x, rsp1.y, rsp1.z, rsp1.scene_id);
+                        break;
+                    case 2://背包信息
+                        rsp2.item_id[index]   = atoi((char*)result_bind[0].buffer);
+                        rsp2.item_type[index] = atoi((char*)result_bind[1].buffer);
+                        rsp2.item_num[index]  = atoi((char*)result_bind[2].buffer);
+                        rsp2.atk[index]       = atoi((char*)result_bind[3].buffer);
+                        rsp2.piercing[index]  = atoi((char*)result_bind[4].buffer);
+                        rsp2.heal_hp[index]   = atoi((char*)result_bind[5].buffer);
+                        rsp2.heal_sta[index]  = atoi((char*)result_bind[6].buffer);
+                        if(islog)ngx_log_stderror(0,"查到数据->第%d个物品:itemid:%d|item_type:%d|item_num:%d|atk:%d|piercing:%d|heal_hp:%d|heal_sta:%d",index, rsp2.item_id[index], rsp2.item_type[index], rsp2.item_num[index],rsp2.atk[index], rsp2.piercing[index], rsp2.heal_hp[index], rsp2.heal_sta[index]);
+                        break;
+                    case 3://任务信息
+                        rsp3.task_id[index]     = atoi((char*)result_bind[0].buffer);
+                        rsp3.task_type[index]   = atoi((char*)result_bind[1].buffer);
+                        rsp3.gain[index]        = atoi((char*)result_bind[2].buffer);
+                        rsp3.require_num[index] = atoi((char*)result_bind[3].buffer);
+                        if(islog)ngx_log_stderror(0,"查到数据->第%d个任务:task_id:%d|task_type:%d|gain:%d|require_num:%d",index, rsp3.task_id[index], rsp3.task_type[index], rsp3.gain[index], rsp3.require_num[index]);
+                        break;
+                }
+                ++index;
+            }
+            rsp2.Len = index;
+            rsp3.Len = index;
+            //释放结果集资源
+            for(unsigned int i = 0; i < num_fields; ++i)delete[] field_buffers[i];
+            delete[] field_buffers;
+            delete[] result_bind;
+            mysql_free_result(result);
+        }
+    );
+    if(!queryResult)
+    {
+        ngx_log_stderror(0, "数据库查询执行失败");
+        return false;
+    }
+
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    void *p_rsp = NULL;
+    int SendLen = 0;
+    switch(p_RecvInfo->queryType)
+    {
+        case 1:
+            SendLen = p_db->serialize_query1_rsp(rsp1, NULL);
+            p_rsp = &rsp1;
+            break;
+        case 2:
+            SendLen = p_db->serialize_query2_rsp(rsp2, NULL);
+            p_rsp = &rsp2;
+            break;
+        case 3:
+            SendLen = p_db->serialize_query3_rsp(rsp3, NULL);
+            p_rsp = &rsp3;
+            break;
+        default:
+            return false;
+    }
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    switch(p_RecvInfo->queryType)
+    {
+        case 1:
+            p_PkgHeader->msgCode = htons(_CMD_SEND_DBQUERY + 1);    
+            actual_len = p_db->serialize_query1_rsp(*(STRUCT_DBQUERY_RSP1*)p_rsp, p_sendInfo);
+            break;
+        case 2:
+            p_PkgHeader->msgCode = htons(_CMD_SEND_DBQUERY + 2);
+            actual_len = p_db->serialize_query2_rsp(*(STRUCT_DBQUERY_RSP2*)p_rsp, p_sendInfo);
+            break;
+        case 3:
+            p_PkgHeader->msgCode = htons(_CMD_SEND_DBQUERY + 3);
+            actual_len = p_db->serialize_query3_rsp(*(STRUCT_DBQUERY_RSP3*)p_rsp, p_sendInfo);
+            break;
+    }
+    if(actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    //计算CRC值
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo, SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBQuery响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+            
+    return true;
+}
+//新增物品
+bool C_logic_Socket::_HandleDBINSERT_ITEM(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //验证包体合法性
+    if(p_PkgBody == NULL || iBodyLength != m_iLenDbinsert1)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //开启事务，因为是批量增加
+    C_Database *p_db = C_Database::GetInstance();
+    MYSQL *mysql = p_db->GetConnection();
+    if(!mysql)return false;
+    if(!p_db->BeginTransaction(mysql))
+    {
+        ngx_log_stderror(0,"事务: 批量增加物品,开启失败");
+        p_db->ReleaseConnection(mysql);
+        return false;
+    }
+    //取到整个发送过来的数据
+    p_STRUCT_DBINSERT1 p_RecvInfo=(p_STRUCT_DBINSERT1)p_PkgBody;
+    p_RecvInfo->Len = ntohl(p_RecvInfo->Len);
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    for(int i=0;i < p_RecvInfo->Len && i < 50;++i)
+    { 
+        p_RecvInfo->Item_id[i] = ntohl(p_RecvInfo->Item_id[i]);
+        p_RecvInfo->Item_num[i] = ntohl(p_RecvInfo->Item_num[i]);
+        p_RecvInfo->exist[i] = ntohl(p_RecvInfo->exist[i]);
+    }
+    if(islog)ngx_log_stderror(0, "-----------开始处理增加物品-----------");
+    if(islog)ngx_log_stderror(0,"原始数据->Len:%d,userID:%d",p_RecvInfo->Len,p_RecvInfo->userID);
+    //初始化响应结构体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    //选择sql语句
+    const char *sql;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[3];memset(&param, 0, sizeof(param));
+
+    for(int i = 0;i <= 2;++i)param[i].buffer_type = MYSQL_TYPE_LONG;
+    for(int i = 0;i < p_RecvInfo->Len && i < 50;++i)//优化点：转移CommonInsert事务控制权给_HandleDBINSERT_ITEM，批量处理，然后一次性提交
+    {
+        if(p_RecvInfo->Item_id[i] == 0)break;
+
+        if(p_RecvInfo->exist[i])//已经存在了,更新数量
+        {
+            sql = Update1;
+            param[0].buffer = &p_RecvInfo->Item_num[i];
+            param[1].buffer = &p_RecvInfo->userID;
+            param[2].buffer = &p_RecvInfo->Item_id[i];
+            for(int j = 0;j <= 2;++j)params.emplace_back(param[j]);
+            rsp.flag[i] = p_db->CommonUpdate(sql,params,1);
+            if(rsp.flag[i] == -1)
+            {
+                ngx_log_stderror(0,"更新第%d个物品时失败,用户id:%d,物品id:%d,数量:%d",i,p_RecvInfo->userID,p_RecvInfo->Item_id[i],p_RecvInfo->Item_num[i]);
+            }
+        }
+        else//否则插入新物品
+        {
+            sql = Insert1;
+            param[0].buffer = &p_RecvInfo->userID;
+            param[1].buffer = &p_RecvInfo->Item_id[i];
+            param[2].buffer = &p_RecvInfo->Item_num[i];
+            for(int j = 0;j <= 2;++j)params.emplace_back(param[j]);
+            rsp.flag[i] = p_db->CommonInsert(sql,params,1);
+            if(rsp.flag[i] == -1)
+            {
+                ngx_log_stderror(0,"插入第%d个物品时失败,用户id:%d,物品id:%d,数量:%d",i,p_RecvInfo->userID,p_RecvInfo->Item_id[i],p_RecvInfo->Item_num[i]);
+            }
+        }
+        
+        params.clear();      
+    }
+    if(!p_db->Commit(mysql))
+    {
+        ngx_log_stderror(0,"事务: 批量增加物品,提交失败");
+        for(int i = 0; i < p_RecvInfo->Len && i < 50; ++i)
+        {
+            rsp.flag[i] = -1;
+        }
+    }
+    rsp.Len = p_RecvInfo->Len;
+    p_db->ReleaseConnection(mysql);
+
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_DBINSERT_item);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len=p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if (actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32=htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBINSERT_ITEM响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    return true;
+}
+//新增任务
+bool C_logic_Socket::_HandleDBINSERT_TASK(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenDbinsert2)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取得整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_DBINSERT2 p_RecvInfo = (p_STRUCT_DBINSERT2)p_PkgBody;
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    p_RecvInfo->task_id = ntohl(p_RecvInfo->task_id);
+    if(islog)ngx_log_stderror(0,"---------------开始处理新增任务-------------");
+    if(islog)ngx_log_stderror(0,"原始数据->userID:%d|task_id:%d",p_RecvInfo->userID,p_RecvInfo->task_id);
+    //初始化响应包体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    rsp.Len = 1;
+    //选择sql语句
+    const char *sql=Insert2;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[3];memset(&param, 0, sizeof(param));
+    
+    for(int i = 0;i <= 2;++i)param[i].buffer_type = MYSQL_TYPE_LONG;
+    param[0].buffer = &p_RecvInfo->userID;
+    param[1].buffer = &p_RecvInfo->task_id;
+    param[2].buffer = &p_RecvInfo->task_id;
+    for(int i = 0;i <= 2;++i)params.emplace_back(param[i]);
+    //执行查询
+    rsp.flag[0]=p_db->CommonInsert(sql,params,0);
+    if(rsp.flag[0]==-1)ngx_log_stderror(0,"增加任务失败");
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_DBINSERT_task);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len=p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if (actual_len != SendLen) 
+    {
+        if(islog)ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32=htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBINSERT_TASK响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    return true;
+}
+//修改玩家
+bool C_logic_Socket::_HandleDBMODIFY_PLAYER(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    //验证包体合法性
+    if(p_PkgBody == NULL || iBodyLength != m_iLenDbmodify1)return false;
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取到整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_DBMODIFY1 p_RecvInfo = (p_STRUCT_DBMODIFY1)p_PkgBody;
+    p_RecvInfo->userID   =ntohl(p_RecvInfo->userID);
+    p_RecvInfo->hp       =ntohl(p_RecvInfo->hp);
+    p_RecvInfo->atk      =ntohl(p_RecvInfo->atk);
+    p_RecvInfo->piercing =ntohl(p_RecvInfo->piercing);
+    if(islog)ngx_log_stderror(0, "------------开始处理修改玩家-----------");
+    if(islog)ngx_log_stderror(0,"原始数据->hp:%d|atk:%d|piercing:%d",p_RecvInfo->hp,p_RecvInfo->atk,p_RecvInfo->piercing);
+    //初始化响应包体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    rsp.Len = 1;
+    //选择sql语句
+    const char *sql = Update2;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[4];memset(&param, 0, sizeof(param));
+    for(int i = 0;i <= 3;++i)param[i].buffer_type = MYSQL_TYPE_LONG;
+    param[0].buffer = &p_RecvInfo->hp;
+    param[1].buffer = &p_RecvInfo->atk;
+    param[2].buffer = &p_RecvInfo->piercing;
+    param[3].buffer = &p_RecvInfo->userID;
+    for(int i = 0;i <= 3;++i)params.emplace_back(param[i]);
+    //执行查询
+    rsp.flag[0]=p_db->CommonUpdate(sql,params,0);
+    if(rsp.flag[0]==-1)ngx_log_stderror(0,"修改玩家(ID:%d)失败",p_RecvInfo->userID);
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_DBMODIFY_plyer);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len=p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if (actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBMODIFY_PLAYER响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    return true;
+}
+//修改物品
+bool C_logic_Socket::_HandleDBMODIFY_ITEM(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenDbmodify2)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //开启事务，批量处理
+    C_Database *p_db = C_Database::GetInstance();
+    MYSQL *mysql = p_db->GetConnection();
+    if(!mysql)return false;
+    if(!p_db->BeginTransaction(mysql))
+    {
+        if(islog)ngx_log_stderror(0,"事务: 批量修改物品,开启失败");
+        p_db->ReleaseConnection(mysql);
+        return false;
+    }
+    //取到整个发送过来的数据
+    p_STRUCT_DBMODIFY2 p_RecvInfo = (p_STRUCT_DBMODIFY2)p_PkgBody;
+    p_RecvInfo->Len = ntohl(p_RecvInfo->Len);
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    for(int i = 0;i < p_RecvInfo->Len && i < 50;++i)
+    {
+        p_RecvInfo->Item_id[i] = ntohl(p_RecvInfo->Item_id[i]);
+        p_RecvInfo->Item_num[i] = ntohl(p_RecvInfo->Item_num[i]);
+    }
+    if(islog)ngx_log_stderror(0,"----------开始处理修改物品---------");
+    if(islog)ngx_log_stderror(0,"原始数据->Len:%d,userID:%d",p_RecvInfo->Len,p_RecvInfo->userID);
+    //初始化响应包体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    //选择sql语句
+    const char *sql=Update1;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[3];memset(&param, 0, sizeof(param));
+
+    for(int i = 0;i <= 2;++i)param[i].buffer_type = MYSQL_TYPE_LONG;
+    for(int i = 0;i < p_RecvInfo->Len && i < 50;++i)
+    {
+        if(p_RecvInfo->Item_id[i] == 0)break;
+
+        param[0].buffer = &p_RecvInfo->Item_num[i];
+        param[1].buffer = &p_RecvInfo->userID;
+        param[2].buffer = &p_RecvInfo->Item_id[i];
+        for(int j = 0;j <= 2; ++j)params.emplace_back(param[j]);
+
+        rsp.flag[i] = p_db->CommonUpdate(sql,params,1);
+        if(rsp.flag[i] == -1)
+        {
+            ngx_log_stderror(0,"更新第%d个物品时失败",i);
+        }
+        params.clear();      
+    }
+    if(!p_db->Commit(mysql))
+    {
+        ngx_log_stderror(0,"事务: 批量修改物品,提交失败");
+        for(int i = 0;i < p_RecvInfo->Len && i < 50;++i)
+        {
+            rsp.flag[i] = -1;
+        }
+    }
+    rsp.Len = p_RecvInfo->Len;
+
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_DBMODIFY_item);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len = p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if(actual_len != SendLen) 
+    {
+        ngx_log_stderror(0,"序列化长度不匹配，预期%d,实际%d",SendLen,actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0,"DBMODIFY_ITEM响应发送成功,发送(%d包体+16消息头+8包头)字节",SendLen);
+    return true;
+}
+//修改任务
+bool C_logic_Socket::_HandleDBMODIFY_TASK(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenDbmodify3)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取得整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_DBMODIFY3 p_RecvInfo = (p_STRUCT_DBMODIFY3)p_PkgBody;
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    p_RecvInfo->task_id = ntohl(p_RecvInfo->task_id);
+    p_RecvInfo->gain = ntohl(p_RecvInfo->gain);
+    if(islog)ngx_log_stderror(0,"------------开始处理修改任务-----------");
+    if(islog)ngx_log_stderror(0,"原始数据->userID:%d,task_id:%d,gain:%d",p_RecvInfo->userID,p_RecvInfo->task_id,p_RecvInfo->gain);
+    //初始化响应包体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    rsp.Len = 1;
+    //选择sql语句
+    const char *sql = Update3;
+    //准备查询参数
+    std::vector<MYSQL_BIND> params;
+    MYSQL_BIND param[4];memset(&param, 0, sizeof(param));
+    for(int i = 0;i <= 3;++i)param[i].buffer_type = MYSQL_TYPE_LONG;
+    param[0].buffer = &p_RecvInfo->gain;
+    param[1].buffer = &p_RecvInfo->gain;
+    param[2].buffer = &p_RecvInfo->userID;
+    param[3].buffer = &p_RecvInfo->task_id;
+    for(int i = 0;i <= 3;++i)params.emplace_back(param[i]);
+    //执行查询
+    rsp.flag[0]=p_db->CommonUpdate(sql,params,0);
+    if(rsp.flag[0]==-1)
+    {
+        ngx_log_stderror(0,"修改任务进度失败");
+    }
+    
+    //准备返回数据
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_DBMODIFY_task);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len=p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if(actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "DBMODIFY_TASK响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    return true;
+}
+//切换场景
+bool C_logic_Socket::_HandleSWAP_SCENE(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenChangeScene)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //开启事务，切换场景涉及删除+增加
+    C_Database *p_db = C_Database::GetInstance();
+    MYSQL *mysql =p_db->GetConnection();
+    if(!mysql)return false;
+    if(!p_db->BeginTransaction(mysql))
+    {
+        ngx_log_stderror(0,"事务: 场景切换,开启失败");
+        p_db->ReleaseConnection(mysql);
+        return false;
+    }
+    //取得整个发送过来的数据
+    p_STRUCT_CHANGESCENE p_RecvInfo = (p_STRUCT_CHANGESCENE)p_PkgBody;
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+    p_RecvInfo->sorceid = ntohl(p_RecvInfo->sorceid);
+    p_RecvInfo->targetid = ntohl(p_RecvInfo->targetid);
+    if(islog)ngx_log_stderror(0,"----------开始执行切换场景----------");
+    if(islog)ngx_log_stderror(0,"原始数据->userID:%d,source:%d,target:%d",p_RecvInfo->userID,p_RecvInfo->sorceid,p_RecvInfo->targetid);
+    //初始化响应结构体
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    //选择sql语句
+    char sourceSceneTable[32] = {0};
+    char targetSceneTable[32] = {0};
+    snprintf(sourceSceneTable, sizeof(sourceSceneTable), "scene%d_sync", p_RecvInfo->sorceid);
+    snprintf(targetSceneTable, sizeof(targetSceneTable), "scene%d_sync", p_RecvInfo->targetid);
+    //拼接删除SQL语句
+    char deleteSql[256] = {0};
+    snprintf(deleteSql, sizeof(deleteSql), "DELETE FROM %s WHERE userID = ?", sourceSceneTable);
+    //准备查询参数
+    std::vector<MYSQL_BIND>params;
+    MYSQL_BIND param;memset(&param,0,sizeof(param));
+    //绑定参数
+    param.buffer_type = MYSQL_TYPE_LONG;
+    param.buffer = &p_RecvInfo->userID;
+    params.emplace_back(param);
+
+    rsp.flag[0] = p_db->CommonDelete(deleteSql,params,0);//先删除原来所在的表的记录
+    if(rsp.flag[0] == -1)
+    {
+        ngx_log_stderror(0,"从场景删除玩家ID:%d失败",p_RecvInfo->userID);
+    }
+    else
+    {
+        //拼接插入SQL语句
+        char insertSql[256] = {0};
+        snprintf(insertSql,sizeof(insertSql),"INSERT INTO %s (userID, hp, x, y, z, rotaX, rotaY, rotaZ, beh, weap_id) VALUES (?,0,0,0,0,0,0,0,0,0)",targetSceneTable);
+        
+        params.clear();
+        //准备插入参数 
+        memset(&param,0,sizeof(param));
+        param.buffer_type = MYSQL_TYPE_LONG;
+        param.buffer = &p_RecvInfo->userID;
+        params.emplace_back(param);
+
+        rsp.flag[0]=p_db->CommonInsert(insertSql,params,false);//再增加新的表的记录
+        if(rsp.flag[0]==-1)
+        {
+            ngx_log_stderror(0,"从场景增加玩家ID:%d失败",p_RecvInfo->userID);
+        }
+    }
+    if(!p_db->Commit(mysql))
+    {
+        ngx_log_stderror(0,"事务: 批量增加,提交失败");
+        rsp.flag[0] = -1;
+    }
+    rsp.Len = 1;
+    p_db->ReleaseConnection(mysql);
+    //把玩家从原先在线列表里删除并添加到新场景里
+    for(auto x = m_ScenePlayers[p_RecvInfo->sorceid].begin();x!=m_ScenePlayers[p_RecvInfo->sorceid].end();)
+    {
+        if(x->userID == p_RecvInfo->userID)
+        {
+            ConnUserMap tmp = *x;
+            x = m_ScenePlayers[p_RecvInfo->sorceid].erase(x);
+            m_ScenePlayers[p_RecvInfo->targetid].push_back(tmp);
+            break;
+        }
+        else ++x;
+    }
+    if(islog)ngx_log_stderror(0,"场景1:%d人|场景2:%d人|场景3:%d人",m_ScenePlayers[1].size(),m_ScenePlayers[2].size(),m_ScenePlayers[3].size());
+    //返回一个结构
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen=p_db->serialize_common_rsp(rsp,NULL);
+    //申请内存并填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader +SendLen,false);
+    memcpy(p_sendbuf,p_MsgHeader,m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf +m_iLenMsgHeader);
+    p_PkgHeader->pkgLen=htons(m_iLenPkgHeader +SendLen);
+    p_PkgHeader->msgCode=htons(_CMD_SEND_SWAP_scene);
+    //序列化并填充包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len = p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if(actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "SWAPSCENE响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+
+    return true;
+}
+//玩家同步自己信息
+bool C_logic_Socket::_HandleSYNC_PLAYER(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenSyncPlayer)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+    //取得整个发送过来的数据
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_SYNC_PLAYER p_RecvInfo = (p_STRUCT_SYNC_PLAYER)p_PkgBody;
+    
+    //复制原始包体数据到临时变量
+    STRUCT_SYNC_PLAYER tempRecvInfo;
+    memcpy(&tempRecvInfo, p_PkgBody, m_iLenSyncPlayer);
+
+    tempRecvInfo.userID = ntohl(tempRecvInfo.userID);
+    tempRecvInfo.name[sizeof(tempRecvInfo.name)-1] = 0;
+    tempRecvInfo.hp = ntohl(tempRecvInfo.hp);
+
+    uint32_t tmp;
+    memcpy(&tmp,&tempRecvInfo.x,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.x,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.y,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.y,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.z,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.z,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.ratoX,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.ratoX,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.ratoY,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.ratoY,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.ratoZ,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.ratoZ,&tmp,sizeof(tmp));
+    memcpy(&tmp,&tempRecvInfo.ratoW,sizeof(tmp));tmp = ntohl(tmp);memcpy(&tempRecvInfo.ratoW,&tmp,sizeof(tmp));
+    tempRecvInfo.beh = ntohl(tempRecvInfo.beh);
+    tempRecvInfo.weap_id = ntohl(tempRecvInfo.weap_id);
+
+    // 日志打印使用转换后的临时变量
+    if(islog) ngx_log_stderror(0, "------------开始处理玩家上传同步信息-----------");
+    if(islog) ngx_log_stderror(0, "原始数据->useid:%d|name:%s|hp:%d|x:%.2f|y:%.2f|z:%.2f|rotaX:%.2f|rotaY:%.2f|rotaZ:%.2f|rotaW:%.2f|beh:%d|weap_id:%d",tempRecvInfo.userID,tempRecvInfo.name,tempRecvInfo.hp,tempRecvInfo.x,tempRecvInfo.y,tempRecvInfo.z,tempRecvInfo.ratoX,tempRecvInfo.ratoY,tempRecvInfo.ratoZ,tempRecvInfo.ratoW,tempRecvInfo.beh,tempRecvInfo.weap_id);
+
+    int userID = ntohl(p_RecvInfo->userID);
+    int sceneId = FindUserScene(userID);
+    if(sceneId == -1)
+    {
+        ngx_log_stderror(0, "玩家%d不在任何场景,同步失败", userID);
+        return false;
+    }
+
+    //构建要广播的同步消息包（包含消息头+包头+包体）
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+
+    //计算包体长度
+    int bodyLen = m_iLenSyncPlayer; 
+    //分配共享消息内存（包含包头+包体，供场景同步线程广播）
+    int sharedBufLen = m_iLenPkgHeader + m_iLenSyncPlayer;
+    char *p_sendbuf = (char *)p_memory->AllocMemory(sharedBufLen, false);
+    //填充包头
+    p_COMM_PKG_HEADER p_PkgHeader = (p_COMM_PKG_HEADER)p_sendbuf;
+    p_PkgHeader->msgCode = htons(_CMD_SEND_SYNC_player);
+    p_PkgHeader->pkgLen = htons(sharedBufLen);
+    //填充包体,复用客户端数据
+    char *p_sendInfo = p_sendbuf + m_iLenPkgHeader;
+    memcpy(p_sendInfo, p_PkgBody, bodyLen);
+    //计算CRC32值
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo, bodyLen));
+    //将消息加入场景队列，由同步线程广播
+    SceneMsg msg;
+    msg.msgBuf = p_sendbuf;
+    msg.msgLen = sharedBufLen;
+    msg.senderUserID = userID;
+
+    pthread_mutex_lock(&m_sceneMsgMutex[sceneId]);
+    m_sceneMsgQueues[sceneId].push(msg);
+    pthread_mutex_unlock(&m_sceneMsgMutex[sceneId]);
+    //sem_post(&m_sceneMsgSem[sceneId]);  // 唤醒同步线程
+    return true;
+}
+//退出游戏
+bool C_logic_Socket::_HandleExit(p_ngx_connect_type p_Conn,p_STRUC_MSG_HEADER p_MsgHeader,char *p_PkgBody,unsigned short iBodyLength)
+{
+    if(p_PkgBody == NULL || iBodyLength != m_iLenExit)
+    {
+        return false;
+    }
+    //添加互斥锁
+    C_lock lock(&p_Conn->logicProcMutex);
+
+    C_Database *p_db = C_Database::GetInstance();
+    p_STRUCT_EXIT p_RecvInfo = (p_STRUCT_EXIT)p_PkgBody;
+    p_RecvInfo->userID = ntohl(p_RecvInfo->userID);
+
+    if(islog)ngx_log_stderror(0,"--------开始处理玩家退出-------");
+    if(islog)ngx_log_stderror(0,"退出玩家ID:%d",p_RecvInfo->userID);
+    
+    STRUCT_COMMON_RSP rsp;memset(&rsp,0,sizeof(rsp));
+    rsp.Len = 1;
+    //把玩家从队列里移除
+    rsp.flag[0] = RemovePlayerByConn(p_Conn);
+    //返回一个结构
+    p_COMM_PKG_HEADER p_PkgHeader;
+    C_Memory *p_memory = C_Memory::GetInstance();
+    C_CRC32 *p_crc32 = C_CRC32::GetInstance();
+    int SendLen = p_db->serialize_common_rsp(rsp,NULL);
+    //分配内存、填充消息头
+    char *p_sendbuf = (char *)p_memory->AllocMemory(m_iLenMsgHeader + m_iLenPkgHeader + SendLen, false);
+    memcpy(p_sendbuf, p_MsgHeader, m_iLenMsgHeader);
+    //填充包头
+    p_PkgHeader = (p_COMM_PKG_HEADER)(p_sendbuf + m_iLenMsgHeader);
+    p_PkgHeader->pkgLen = htons(m_iLenPkgHeader + SendLen);
+    p_PkgHeader->msgCode = htons(_CMD_SEND_EXIT);
+    //填充并序列化包体
+    char *p_sendInfo = p_sendbuf + m_iLenMsgHeader + m_iLenPkgHeader;
+    int actual_len = 0;
+    actual_len = p_db->serialize_common_rsp(rsp,p_sendInfo);
+    if(actual_len != SendLen) 
+    {
+        ngx_log_stderror(0, "序列化长度不匹配，预期%d,实际%d", SendLen, actual_len);
+        p_memory->FreeMemory(p_sendbuf);
+        return false;
+    }
+    p_PkgHeader->crc32 = htonl(p_crc32->Get_CRC((unsigned char *)p_sendInfo,SendLen));
+    //发送数据
+    msgSend(p_sendbuf);
+    if(islog)ngx_log_stderror(0, "EXIT响应发送成功,发送(%d包体+16消息头+8包头)字节", SendLen);
+    return true;
+}
